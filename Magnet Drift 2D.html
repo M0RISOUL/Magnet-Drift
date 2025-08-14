@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Magnet Drift — 2D Game</title>
+  <style>
+    :root { color-scheme: dark light; }
+    html, body { height: 100%; margin: 0; }
+    body { display: grid; place-items: center; background: #0f1220; color: #e6e9ef; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    .wrap { width: min(100vw, 960px); padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 8px; letter-spacing: 0.5px; }
+    p, li { font-size: 14px; line-height: 1.4; color: #c9d2e2; }
+    canvas { width: 100%; height: auto; border-radius: 16px; background: radial-gradient(1200px 500px at 50% 50%, #1a1f3b 0, #0f1220 60%); box-shadow: 0 10px 40px rgba(0,0,0,.45), inset 0 0 40px rgba(22,30,65,.6); }
+    .hud { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 10px 2px 14px; }
+    .pill { padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,.06); backdrop-filter: blur(3px); border: 1px solid rgba(255,255,255,.08); }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background: rgba(255,255,255,.08); padding: 2px 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,.1); }
+    .footer { opacity: .7; margin-top: 10px; font-size: 12px; }
+    button { cursor: pointer; border: 0; background: #2c3b8a; color: #fff; padding: 8px 12px; border-radius: 10px; font-weight: 600; box-shadow: 0 4px 14px rgba(44,59,138,.4); }
+    button:hover { filter: brightness(1.1); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Magnet Drift — 2D Game</h1>
+    <div class="hud">
+      <div class="pill" id="status">Collect 6 shards. Avoid spikes and edges.</div>
+      <div class="pill">Controls: <span class="kbd">WASD</span>/<span class="kbd">Arrows</span> move, <span class="kbd">Space</span> Field Swap, <span class="kbd">P</span> pause, <span class="kbd">R</span> restart</div>
+      <button id="restartBtn" aria-label="Restart">Restart</button>
+    </div>
+    <canvas id="game" width="900" height="540" role="img" aria-label="Magnet Drift game"></canvas>
+    <p class="footer">Unique mechanic: Four corner magnets pulse. Press <span class="kbd">Space</span> to invert fields temporarily (Field Swap). Your orb has momentum — master the drift.</p>
+  </div>
+  <script>
+  "use strict";
+  // Security/robustness notes:
+  // - No eval/Function/innerHTML from external sources.
+  // - No network calls, trackers, or storage of personal data.
+  // - Input is only from keyboard events; keys are bounded and sanitized.
+  // - Game contained entirely in this file; runs offline.
+
+  (function() {
+    /** @type {HTMLCanvasElement} */
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const statusEl = document.getElementById('status');
+    const restartBtn = document.getElementById('restartBtn');
+
+    // --- Constants ---
+    const W = canvas.width, H = canvas.height;
+    const DT = 1/60; // fixed timestep
+    const FRICTION = 0.992; // drift feel
+    const THRUST = 220; // player thrust per second
+    const MAX_SPEED = 450;
+    const SHARDS_TO_WIN = 6;
+    const SPIKE_PERIOD = 5.0; // seconds
+    const MAGNET_BASE = 260;   // base magnet strength
+    const MAGNET_PULSE = 160;  // added via sine wave
+    const MAGNET_MIN_DIST = 40; // clamp to avoid extreme forces
+    const SWAP_DURATION = 2.5; // seconds of polarity inversion
+    const SWAP_COOLDOWN = 5.0; // seconds cooldown
+
+    // --- Game State ---
+    const state = {
+      time: 0,
+      running: true,
+      win: false,
+      lose: false,
+      shardsCollected: 0,
+      swapActiveUntil: -1,
+      swapReadyAt: 0,
+      rngSeed: Math.floor(Math.random()*1e9) ^ Date.now(),
+      player: { x: W*0.5, y: H*0.5, vx: 0, vy: 0, r: 11 },
+      shards: [],
+      spikes: [],
+      magnets: [
+        { x: 0,   y: 0 },
+        { x: W,   y: 0 },
+        { x: 0,   y: H },
+        { x: W,   y: H },
+      ],
+    };
+
+    // --- Deterministic RNG (Mulberry32) for reproducible levels ---
+    function rng() {
+      let t = state.rngSeed += 0x6D2B79F5;
+      t = Math.imul(t ^ t >>> 15, t | 1);
+      t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    }
+
+    // --- Utility ---
+    function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+    function len(x,y){ return Math.hypot(x,y); }
+
+    function reset(levelSeed) {
+      state.time = 0; state.running = true; state.win = false; state.lose = false;
+      state.shardsCollected = 0; state.swapActiveUntil = -1; state.swapReadyAt = 0;
+      if (typeof levelSeed === 'number') state.rngSeed = levelSeed >>> 0;
+      state.player.x = W*0.5; state.player.y = H*0.5; state.player.vx = 0; state.player.vy = 0;
+      // Place shards in safe zones away from corners/edges
+      state.shards = Array.from({length: SHARDS_TO_WIN + 2}, () => placeShard());
+      // Build spike segments along edges (animated)
+      state.spikes = buildSpikes();
+      updateStatus();
+    }
+
+    function placeShard(){
+      let x,y; let tries = 0;
+      do {
+        x = 60 + rng() * (W-120);
+        y = 60 + rng() * (H-120);
+        tries++;
+      } while ((nearCorner(x,y,110) || nearEdge(x,y,24)) && tries < 40);
+      return { x, y, r: 7 + rng()*3, taken: false };
+    }
+
+    function nearCorner(x,y,d){
+      const corners = [[0,0],[W,0],[0,H],[W,H]];
+      for(const c of corners){ if (len(x-c[0], y-c[1]) < d) return true; }
+      return false;
+    }
+    function nearEdge(x,y,m){ return (x < m || x > W-m || y < m || y > H-m); }
+
+    function buildSpikes(){
+      const segs = 18; // per edge
+      const edges = [];
+      // top edge
+      for (let i=0;i<segs;i++) edges.push({ side:'top', i, n:segs, phase:rng()*Math.PI*2 });
+      for (let i=0;i<segs;i++) edges.push({ side:'bottom', i, n:segs, phase:rng()*Math.PI*2 });
+      for (let i=0;i<segs;i++) edges.push({ side:'left', i, n:segs, phase:rng()*Math.PI*2 });
+      for (let i=0;i<segs;i++) edges.push({ side:'right', i, n:segs, phase:rng()*Math.PI*2 });
+      return edges;
+    }
+
+    // --- Input ---
+    const keys = Object.create(null);
+    const allowedKeys = new Set([
+      'ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','a','s','d','W','A','S','D',' ','p','P','r','R'
+    ]);
+
+    addEventListener('keydown', (e) => {
+      if (!allowedKeys.has(e.key)) return; // ignore all other keys
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+      keys[e.key] = true;
+      if (e.key === ' ' && state.time >= state.swapReadyAt) {
+        state.swapActiveUntil = state.time + SWAP_DURATION;
+        state.swapReadyAt = state.time + SWAP_COOLDOWN + SWAP_DURATION;
+        flashStatus('Field Swap engaged!');
+      }
+      if (e.key === 'p' || e.key === 'P') { state.running = !state.running; updateStatus(); }
+      if (e.key === 'r' || e.key === 'R') { reset(); }
+    }, { passive: false });
+
+    addEventListener('keyup', (e) => { if (allowedKeys.has(e.key)) keys[e.key] = false; });
+    restartBtn.addEventListener('click', () => reset());
+
+    // --- Game Loop ---
+    let accumulator = 0; let last = performance.now();
+    function loop(now){
+      const dt = Math.min(0.05, (now - last)/1000);
+      last = now; accumulator += dt;
+      while (accumulator >= DT) { step(DT); accumulator -= DT; }
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    function step(dt){
+      if (!state.running || state.win || state.lose) return;
+      state.time += dt;
+
+      // Input thrust
+      let ax = 0, ay = 0;
+      if (keys['ArrowUp'] || keys['w'] || keys['W']) ay -= THRUST;
+      if (keys['ArrowDown'] || keys['s'] || keys['S']) ay += THRUST;
+      if (keys['ArrowLeft'] || keys['a'] || keys['A']) ax -= THRUST;
+      if (keys['ArrowRight'] || keys['d'] || keys['D']) ax += THRUST;
+
+      // Magnet forces from corners (pulsing)
+      const swapSign = state.time < state.swapActiveUntil ? -1 : 1;
+      for (const m of state.magnets){
+        const dx = m.x - state.player.x;
+        const dy = m.y - state.player.y;
+        const d = Math.max(MAGNET_MIN_DIST, Math.hypot(dx,dy));
+        // pulse: sin oscillation offset per magnet
+        const phase = (state.time + (m.x+m.y)*0.0009) * 2.0; // speed
+        const strength = (MAGNET_BASE + MAGNET_PULSE * Math.sin(phase)) * swapSign;
+        const f = strength / (d*d);
+        ax += f * dx;
+        ay += f * dy;
+      }
+
+      // Update velocity & clamp
+      state.player.vx = (state.player.vx + ax * dt) * FRICTION;
+      state.player.vy = (state.player.vy + ay * dt) * FRICTION;
+      const sp = Math.hypot(state.player.vx, state.player.vy);
+      if (sp > MAX_SPEED){
+        const k = MAX_SPEED / sp; state.player.vx *= k; state.player.vy *= k;
+      }
+
+      // Update position
+      state.player.x += state.player.vx * dt;
+      state.player.y += state.player.vy * dt;
+
+      // Check spikes/edges
+      if (hitEdgesWithSpikes()) { lose('You hit the spikes!'); return; }
+
+      // Collect shards
+      for (const s of state.shards){
+        if (!s.taken && len(s.x - state.player.x, s.y - state.player.y) < s.r + state.player.r) {
+          s.taken = true; state.shardsCollected++;
+          flashStatus(`Shard collected (${state.shardsCollected}/${SHARDS_TO_WIN})`);
+        }
+      }
+
+      // Win condition
+      if (state.shardsCollected >= SHARDS_TO_WIN) { win('All shards collected!'); }
+    }
+
+    function spikeAmountFor(t, phase){
+      // 0..1 amount of spike extension per segment: smooth triangle via sin
+      const s = Math.sin((t + phase) * (Math.PI*2 / SPIKE_PERIOD));
+      return (s*0.5 + 0.5); // 0..1
+    }
+
+    function hitEdgesWithSpikes(){
+      const p = state.player, r = p.r;
+      // collide with walls if spikes extended sufficiently at that segment
+      for (const seg of state.spikes){
+        const amt = spikeAmountFor(state.time, seg.phase);
+        const reach = 10 + 28 * amt; // how far spikes reach into arena
+        // compute segment span
+        if (seg.side === 'top'){
+          const x0 = (seg.i/seg.n)*W, x1 = ((seg.i+1)/seg.n)*W;
+          if (p.y - r < reach && p.x > x0 && p.x < x1) return true;
+        } else if (seg.side === 'bottom'){
+          const x0 = (seg.i/seg.n)*W, x1 = ((seg.i+1)/seg.n)*W;
+          if (p.y + r > H - reach && p.x > x0 && p.x < x1) return true;
+        } else if (seg.side === 'left'){
+          const y0 = (seg.i/seg.n)*H, y1 = ((seg.i+1)/seg.n)*H;
+          if (p.x - r < reach && p.y > y0 && p.y < y1) return true;
+        } else if (seg.side === 'right'){
+          const y0 = (seg.i/seg.n)*H, y1 = ((seg.i+1)/seg.n)*H;
+          if (p.x + r > W - reach && p.y > y0 && p.y < y1) return true;
+        }
+      }
+      return false;
+    }
+
+    // --- Rendering ---
+    function render(){
+      // background grid glow
+      ctx.clearRect(0,0,W,H);
+      drawArena();
+      drawShards();
+      drawPlayer();
+      drawMagnets();
+      drawHUD();
+      if (state.win || state.lose) drawBanner();
+    }
+
+    function drawArena(){
+      // Edge walls
+      ctx.save();
+      // outer frame
+      ctx.strokeStyle = '#3a4270';
+      ctx.lineWidth = 4; ctx.strokeRect(2,2,W-4,H-4);
+
+      // animated spikes
+      for (const seg of state.spikes){
+        const amt = spikeAmountFor(state.time, seg.phase);
+        const reach = 10 + 28 * amt;
+        ctx.beginPath();
+        if (seg.side === 'top'){
+          const x0 = (seg.i/seg.n)*W, x1 = ((seg.i+1)/seg.n)*W, xm = (x0+x1)/2;
+          ctx.moveTo(x0, 0); ctx.lineTo(xm, reach); ctx.lineTo(x1, 0);
+        } else if (seg.side === 'bottom'){
+          const x0 = (seg.i/seg.n)*W, x1 = ((seg.i+1)/seg.n)*W, xm = (x0+x1)/2;
+          ctx.moveTo(x0, H); ctx.lineTo(xm, H-reach); ctx.lineTo(x1, H);
+        } else if (seg.side === 'left'){
+          const y0 = (seg.i/seg.n)*H, y1 = ((seg.i+1)/seg.n)*H, ym = (y0+y1)/2;
+          ctx.moveTo(0, y0); ctx.lineTo(reach, ym); ctx.lineTo(0, y1);
+        } else {
+          const y0 = (seg.i/seg.n)*H, y1 = ((seg.i+1)/seg.n)*H, ym = (y0+y1)/2;
+          ctx.moveTo(W, y0); ctx.lineTo(W-reach, ym); ctx.lineTo(W, y1);
+        }
+        ctx.globalAlpha = 0.9*amt + 0.1;
+        ctx.fillStyle = '#7b88ff';
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    function drawShards(){
+      for (const s of state.shards){
+        if (s.taken) continue;
+        ctx.save();
+        const pulse = 0.6 + 0.4*Math.sin(state.time*6 + (s.x+s.y)*0.01);
+        ctx.translate(s.x, s.y);
+        ctx.rotate(((s.x*31 + s.y*17)|0) * 0.001 + state.time*0.8);
+        ctx.scale(1+pulse*0.08, 1+pulse*0.08);
+        // diamond
+        ctx.beginPath();
+        ctx.moveTo(0, -s.r);
+        ctx.lineTo(s.r*0.9, 0);
+        ctx.lineTo(0, s.r);
+        ctx.lineTo(-s.r*0.9, 0);
+        ctx.closePath();
+        const grad = ctx.createLinearGradient(-s.r, -s.r, s.r, s.r);
+        grad.addColorStop(0, '#9be9ff');
+        grad.addColorStop(1, '#66ffcc');
+        ctx.fillStyle = grad;
+        ctx.shadowColor = '#9be9ff';
+        ctx.shadowBlur = 12;
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function drawPlayer(){
+      const p = state.player;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      const speed = Math.hypot(p.vx, p.vy);
+      const tail = clamp(speed/ MAX_SPEED, 0, 1) * 16;
+
+      // trail
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.lineTo(-p.vx*0.05, -p.vy*0.05);
+      ctx.strokeStyle = 'rgba(160,200,255,.6)';
+      ctx.lineWidth = 6; ctx.lineCap = 'round';
+      ctx.stroke();
+
+      // orb
+      const rad = p.r + 1.5*Math.sin(state.time*10 + speed*0.02);
+      const g = ctx.createRadialGradient(0,0,rad*0.2, 0,0,rad);
+      g.addColorStop(0, '#ffffff');
+      g.addColorStop(1, '#6aa1ff');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0,0,rad,0,Math.PI*2);
+      ctx.shadowColor = '#6aa1ff'; ctx.shadowBlur = 18; ctx.fill();
+
+      // Field Swap halo
+      if (state.time < state.swapActiveUntil){
+        ctx.beginPath(); ctx.arc(0,0,rad+6,0,Math.PI*2);
+        ctx.strokeStyle = '#ffdf6a'; ctx.lineWidth = 2.5; ctx.setLineDash([6,4]); ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawMagnets(){
+      const swap = state.time < state.swapActiveUntil;
+      for (const m of state.magnets){
+        const phase = (state.time + (m.x+m.y)*0.0009) * 2.0;
+        const pulse = 0.6 + 0.4*Math.sin(phase);
+        const r = 12 + 6*pulse;
+        ctx.save();
+        ctx.translate(m.x, m.y);
+        ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2);
+        ctx.fillStyle = swap ? '#ffd75a' : '#88a0ff';
+        ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 22; ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function drawHUD(){
+      // cooldown ring UI in corner
+      const cx = 70, cy = 64, R = 28;
+      const ready = state.time >= state.swapReadyAt;
+      const remaining = ready ? 0 : clamp((state.swapReadyAt - state.time) / (SWAP_COOLDOWN + SWAP_DURATION), 0, 1);
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.beginPath(); ctx.arc(0,0,R,0,Math.PI*2);
+      ctx.strokeStyle = '#23305f'; ctx.lineWidth = 8; ctx.stroke();
+      if (!ready){
+        ctx.beginPath(); ctx.moveTo(0,0);
+        ctx.fillStyle = '#ffdf6a';
+        ctx.moveTo(0,0);
+        ctx.arc(0,0,R-4, -Math.PI/2, -Math.PI/2 + (1-remaining)*Math.PI*2);
+        ctx.lineTo(0,0); ctx.fill();
+      }
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = ready ? '#9cff8a' : '#e6e9ef';
+      ctx.fillText('SWAP', 0, 0);
+      ctx.restore();
+    }
+
+    function drawBanner(){
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,.55)';
+      ctx.fillRect(0,0,W,H);
+      const text = state.win ? 'YOU WIN!' : 'GAME OVER';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 48px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(text, W/2, H/2 - 10);
+      ctx.font = '18px system-ui, sans-serif';
+      ctx.fillText('Press R to restart', W/2, H/2 + 24);
+      ctx.restore();
+    }
+
+    function updateStatus(){
+      const swapLeft = Math.max(0, state.swapReadyAt - state.time);
+      const s = state.running ? 'Playing' : 'Paused';
+      const msg = `${s} • Shards: ${state.shardsCollected}/${SHARDS_TO_WIN} • Swap ${swapLeft>0?`CD ${swapLeft.toFixed(1)}s`: 'Ready'}`;
+      // Use textContent (not innerHTML) for safety
+      statusEl.textContent = msg;
+    }
+
+    let flashTimer = 0; let flashOriginal = '';
+    function flashStatus(msg){
+      if (!flashOriginal) flashOriginal = statusEl.textContent;
+      statusEl.textContent = msg;
+      clearTimeout(flashTimer);
+      flashTimer = window.setTimeout(() => { statusEl.textContent = flashOriginal; flashOriginal = ''; }, 900);
+    }
+
+    function win(msg){ state.win = true; state.running = false; statusEl.textContent = msg; }
+    function lose(msg){ state.lose = true; state.running = false; statusEl.textContent = msg; }
+
+    // Initialize and start
+    reset();
+    requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>
